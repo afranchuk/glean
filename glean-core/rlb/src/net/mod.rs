@@ -8,10 +8,10 @@
 //! retries, upload limitations and error tracking.
 
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+    atomic::{AtomicU8, Ordering},
+    Arc, Mutex,
 };
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use glean_core::upload::PingUploadTask;
@@ -41,11 +41,16 @@ pub(crate) struct UploadManager {
     inner: Arc<Inner>,
 }
 
+const STATE_STOPPED: u8 = 0;
+const STATE_RUNNING: u8 = 1;
+const STATE_SHUTTING_DOWN: u8 = 2;
+
 #[derive(Debug)]
 struct Inner {
     server_endpoint: String,
     uploader: Box<dyn PingUploader + 'static>,
-    thread_running: AtomicBool,
+    thread_running: AtomicU8,
+    handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl UploadManager {
@@ -63,7 +68,8 @@ impl UploadManager {
             inner: Arc::new(Inner {
                 server_endpoint,
                 uploader: new_uploader,
-                thread_running: AtomicBool::new(false),
+                thread_running: AtomicU8::new(STATE_STOPPED),
+                handle: Mutex::new(None),
             }),
         }
     }
@@ -76,7 +82,12 @@ impl UploadManager {
         if self
             .inner
             .thread_running
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .compare_exchange(
+                STATE_STOPPED,
+                STATE_RUNNING,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
             .is_err()
         {
             return;
@@ -84,7 +95,9 @@ impl UploadManager {
 
         let inner = Arc::clone(&self.inner);
 
-        thread::Builder::new()
+        // Need to lock before we start so that noone thinks we're not running.
+        let mut handle = self.inner.handle.lock().unwrap();
+        let thread = thread::Builder::new()
             .name("glean.upload".into())
             .spawn(move || {
                 log::trace!("Started glean.upload thread");
@@ -115,11 +128,41 @@ impl UploadManager {
                             break;
                         }
                     }
+
+                    let status = inner.thread_running.load(Ordering::SeqCst);
+                    // asked to shut down. let's do it.
+                    if status == STATE_SHUTTING_DOWN {
+                        break;
+                    }
                 }
 
-                // Clear the running flag to signal that this thread is done.
-                inner.thread_running.store(false, Ordering::SeqCst);
+                // Clear the running flag to signal that this thread is done,
+                // but only if there's no shutdown thread.
+                let _ = inner.thread_running.compare_exchange(
+                    STATE_RUNNING,
+                    STATE_STOPPED,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
             })
             .expect("Failed to spawn Glean's uploader thread");
+        *handle = Some(thread);
+    }
+
+    pub(crate) fn shutdown(&self) {
+        // mark as shutting down.
+        self.inner
+            .thread_running
+            .store(STATE_SHUTTING_DOWN, Ordering::SeqCst);
+
+        // take the thread handle out.
+        let mut handle = self.inner.handle.lock().unwrap();
+        let thread = handle.take();
+
+        if let Some(thread) = thread {
+            thread
+                .join()
+                .expect("couldn't join on the uploader thread.");
+        }
     }
 }

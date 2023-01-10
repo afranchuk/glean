@@ -237,6 +237,14 @@ pub trait OnGleanEvents: Send {
 
     /// Called when upload is disabled and uploads should be stopped
     fn cancel_uploads(&self) -> Result<(), CallbackError>;
+
+    /// Called on shutdown, before glean-core is fully shutdown.
+    ///
+    /// This MUST NOT put any new tasks on the dispatcher.
+    /// This SHOULD NOT block arbitrarily long.
+    fn on_shutdown(&self) {
+        // empty by default
+    }
 }
 
 /// Initializes Glean.
@@ -498,6 +506,13 @@ pub fn shutdown() {
 
     if let Err(e) = dispatcher::shutdown() {
         log::error!("Can't shutdown dispatcher thread: {:?}", e);
+    }
+
+    // Call on_shutdown.
+    // Need to be done without holding a lock on the global Glean object.
+    {
+        let state = global_state().lock().unwrap();
+        state.callbacks.on_shutdown();
     }
 
     // Be sure to call this _after_ draining the dispatcher
