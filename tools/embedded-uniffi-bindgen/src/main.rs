@@ -6,7 +6,7 @@ use std::env;
 
 use anyhow::{bail, Context};
 use camino::Utf8PathBuf;
-use uniffi_bindgen::generate_bindings;
+use uniffi::generate_bindings;
 
 fn main() -> anyhow::Result<()> {
     let mut args = env::args().skip(1);
